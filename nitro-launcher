@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+STATE_HOME="${NITRO_GPU_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/nitro-gpu-switcher}"
+PROFILE_FILE="$STATE_HOME/active-profile"
+launcher=$(basename "$0")
+
+case "$launcher" in
+  steam)  target=/usr/bin/steam ;;
+  heroic) target=/usr/bin/heroic ;;
+  *) printf 'Launcher não reconhecido: %s\n' "$launcher" >&2; exit 2 ;;
+esac
+
+profile=restored
+[[ -r "$PROFILE_FILE" ]] && profile=$(<"$PROFILE_FILE")
+
+if [[ "$profile" == nvidia || "$profile" == hybrid ]]; then
+  exec env \
+    __NV_PRIME_RENDER_OFFLOAD=1 \
+    __GLX_VENDOR_LIBRARY_NAME=nvidia \
+    __VK_LAYER_NV_optimus=NVIDIA_only \
+    DRI_PRIME=1 \
+    "$target" "$@"
+fi
+
+if [[ "$profile" == intel ]]; then
+  exec env \
+    -u __NV_PRIME_RENDER_OFFLOAD \
+    -u __GLX_VENDOR_LIBRARY_NAME \
+    -u __VK_LAYER_NV_optimus \
+    -u GBM_BACKEND \
+    DRI_PRIME=0 \
+    "$target" "$@"
+fi
+
+exec "$target" "$@"

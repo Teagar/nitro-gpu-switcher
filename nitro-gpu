@@ -2,16 +2,23 @@
 set -Eeuo pipefail
 
 APP_NAME="Nitro GPU Switcher"
-VERSION="1.0.0"
+VERSION="1.1.0"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 STATE_HOME="${NITRO_GPU_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/nitro-gpu-switcher}"
 BACKUP_HOME="$STATE_HOME/backups"
 PROFILE_FILE="$STATE_HOME/active-profile"
+ORIGINAL_HOME="$STATE_HOME/original"
+INSTALL_BACKUP_HOME="$STATE_HOME/install-backups"
 NIRI_HOME="${NIRI_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/niri}"
 NIRI_DEBUG="$NIRI_HOME/config/debug.kdl"
 NIRI_ENV="$NIRI_HOME/config/environment.kdl"
 SYSTEM_ENV="${SYSTEM_ENV:-/etc/environment}"
 GTA_APP_ID="${GTA_APP_ID:-9d2d0eb64d5c44529cece33fe2a46482}"
-HEROIC_CONFIG="${HEROIC_GTA_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/heroic/GamesConfig/$GTA_APP_ID.json}"
+HEROIC_HOME="${HEROIC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/heroic}"
+HEROIC_GAMES_DIR="$HEROIC_HOME/GamesConfig"
+HEROIC_GLOBAL="$HEROIC_HOME/config.json"
+HEROIC_CONFIG="${HEROIC_GTA_CONFIG:-$HEROIC_GAMES_DIR/$GTA_APP_ID.json}"
+LOCAL_APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 
 if [[ -t 1 ]]; then
   RESET=$'\033[0m'; BOLD=$'\033[1m'; DIM=$'\033[2m'
@@ -93,6 +100,7 @@ profile_name() {
     nvidia) printf '100%% NVIDIA' ;;
     intel)  printf '100%% Intel' ;;
     hybrid) printf 'Híbrido recomendado' ;;
+    restored) printf 'Configuração original' ;;
     *)      printf 'Desconhecido' ;;
   esac
 }
@@ -118,9 +126,40 @@ backup_files() {
   mkdir -p "$BACKUP_DIR"
   [[ -f "$NIRI_DEBUG" ]] && cp -a "$NIRI_DEBUG" "$BACKUP_DIR/debug.kdl"
   [[ -f "$NIRI_ENV" ]] && cp -a "$NIRI_ENV" "$BACKUP_DIR/environment.kdl"
-  [[ -f "$HEROIC_CONFIG" ]] && cp -a "$HEROIC_CONFIG" "$BACKUP_DIR/heroic-gta.json"
+  [[ -f "$HEROIC_GLOBAL" ]] && cp -a "$HEROIC_GLOBAL" "$BACKUP_DIR/heroic-global.json"
+  [[ -d "$HEROIC_GAMES_DIR" ]] && cp -a "$HEROIC_GAMES_DIR" "$BACKUP_DIR/GamesConfig"
   [[ -r "$SYSTEM_ENV" ]] && cp -a "$SYSTEM_ENV" "$BACKUP_DIR/system-environment"
   info "Backup: $BACKUP_DIR"
+}
+
+capture_originals() {
+  mkdir -p "$ORIGINAL_HOME/heroic-games"
+
+  # Migra o backup criado pela versão 1.0, caso o primeiro perfil já tenha sido aplicado.
+  local earliest
+  earliest=$(find "$BACKUP_HOME" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | head -n1 || true)
+  if [[ ! -f "$ORIGINAL_HOME/niri-debug.kdl" ]]; then
+    if [[ -n "$earliest" && -f "$earliest/debug.kdl" ]]; then
+      cp -a "$earliest/debug.kdl" "$ORIGINAL_HOME/niri-debug.kdl"
+      cp -a "$earliest/environment.kdl" "$ORIGINAL_HOME/niri-environment.kdl"
+      cp -a "$earliest/system-environment" "$ORIGINAL_HOME/system-environment"
+      [[ -f "$earliest/heroic-gta.json" ]] && cp -a "$earliest/heroic-gta.json" "$ORIGINAL_HOME/heroic-games/$GTA_APP_ID.json"
+    else
+      cp -a "$NIRI_DEBUG" "$ORIGINAL_HOME/niri-debug.kdl"
+      cp -a "$NIRI_ENV" "$ORIGINAL_HOME/niri-environment.kdl"
+      cp -a "$SYSTEM_ENV" "$ORIGINAL_HOME/system-environment"
+    fi
+  fi
+
+  [[ -f "$ORIGINAL_HOME/heroic-global.json" || ! -f "$HEROIC_GLOBAL" ]] || cp -a "$HEROIC_GLOBAL" "$ORIGINAL_HOME/heroic-global.json"
+  local config destination
+  if [[ -d "$HEROIC_GAMES_DIR" ]]; then
+    for config in "$HEROIC_GAMES_DIR"/*.json; do
+      [[ -f "$config" ]] || continue
+      destination="$ORIGINAL_HOME/heroic-games/$(basename "$config")"
+      [[ -f "$destination" ]] || cp -a "$config" "$destination"
+    done
+  fi
 }
 
 set_niri_renderer() {
@@ -184,44 +223,62 @@ if profile == "nvidia":
     lines.extend(["__NV_PRIME_RENDER_OFFLOAD=1", "__GLX_VENDOR_LIBRARY_NAME=nvidia"])
 print("\n".join(lines).rstrip() + "\n")
 PY
+  if cmp -s "$temp" "$SYSTEM_ENV"; then
+    rm -f "$temp"
+    return
+  fi
   sudo install -m 0644 "$temp" "$SYSTEM_ENV"
   rm -f "$temp"
 }
 
 set_heroic_profile() {
   local profile="$1"
-  [[ -f "$HEROIC_CONFIG" ]] || { warn "Configuração do GTA não encontrada; etapa Heroic ignorada."; return; }
-  python3 - "$HEROIC_CONFIG" "$GTA_APP_ID" "$profile" <<'PY'
+  [[ -d "$HEROIC_GAMES_DIR" ]] || { warn "Diretório do Heroic não encontrado; etapa ignorada."; return; }
+  python3 - "$HEROIC_GLOBAL" "$HEROIC_GAMES_DIR" "$profile" <<'PY'
 import json, pathlib, sys
-path, app_id, profile = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
-data = json.loads(path.read_text())
-game = data.get(app_id)
-if not isinstance(game, dict):
-    raise SystemExit(f"Entrada {app_id} não encontrada em {path}")
-
+global_path, games_dir, profile = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+use_nvidia = profile in {"nvidia", "hybrid"}
 managed = {
     "__NV_PRIME_RENDER_OFFLOAD", "__GLX_VENDOR_LIBRARY_NAME",
     "__VK_LAYER_NV_optimus", "DRI_PRIME", "DXVK_FILTER_DEVICE_NAME"
 }
-options = [item for item in game.get("enviromentOptions", [])
-           if item.get("key") not in managed]
-if profile in {"nvidia", "hybrid"}:
-    game["nvidiaPrime"] = True
-    options += [
-        {"key": "__NV_PRIME_RENDER_OFFLOAD", "value": "1"},
-        {"key": "__GLX_VENDOR_LIBRARY_NAME", "value": "nvidia"},
-        {"key": "__VK_LAYER_NV_optimus", "value": "NVIDIA_only"},
-        {"key": "DRI_PRIME", "value": "1"},
-    ]
-else:
-    game["nvidiaPrime"] = False
-    options += [
-        {"key": "DRI_PRIME", "value": "0"},
-        {"key": "DXVK_FILTER_DEVICE_NAME", "value": "Intel"},
-    ]
-game["enviromentOptions"] = options
-path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+def configure(settings):
+    options = [item for item in settings.get("enviromentOptions", [])
+               if isinstance(item, dict) and item.get("key") not in managed]
+    settings["nvidiaPrime"] = use_nvidia
+    if use_nvidia:
+        options += [
+            {"key": "__NV_PRIME_RENDER_OFFLOAD", "value": "1"},
+            {"key": "__GLX_VENDOR_LIBRARY_NAME", "value": "nvidia"},
+            {"key": "__VK_LAYER_NV_optimus", "value": "NVIDIA_only"},
+            {"key": "DRI_PRIME", "value": "1"},
+        ]
+    else:
+        options += [
+            {"key": "DRI_PRIME", "value": "0"},
+            {"key": "DXVK_FILTER_DEVICE_NAME", "value": "Intel"},
+        ]
+    settings["enviromentOptions"] = options
+
+if global_path.is_file():
+    data = json.loads(global_path.read_text())
+    defaults = data.get("defaultSettings")
+    if isinstance(defaults, dict):
+        configure(defaults)
+        global_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+for path in sorted(games_dir.glob("*.json")):
+    data = json.loads(path.read_text())
+    changed = False
+    for key, settings in data.items():
+        if key != "version" and isinstance(settings, dict):
+            configure(settings)
+            changed = True
+    if changed:
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 PY
+  success "Heroic configurado para todos os jogos atuais e futuros"
 }
 
 ensure_intel_vulkan() {
@@ -247,6 +304,61 @@ validate_niri() {
   fi
 }
 
+restore_originals() {
+  [[ -f "$ORIGINAL_HOME/niri-debug.kdl" ]] || die "Nenhum estado original foi registrado ainda."
+  backup_files
+  info "Restaurando o estado anterior à primeira troca de perfil..."
+
+  sudo install -m 0644 "$ORIGINAL_HOME/system-environment" "$SYSTEM_ENV"
+  cp -a "$ORIGINAL_HOME/niri-debug.kdl" "$NIRI_DEBUG"
+  cp -a "$ORIGINAL_HOME/niri-environment.kdl" "$NIRI_ENV"
+  [[ -f "$ORIGINAL_HOME/heroic-global.json" ]] && cp -a "$ORIGINAL_HOME/heroic-global.json" "$HEROIC_GLOBAL"
+
+  local config
+  for config in "$ORIGINAL_HOME/heroic-games"/*.json; do
+    [[ -f "$config" ]] || continue
+    cp -a "$config" "$HEROIC_GAMES_DIR/$(basename "$config")"
+  done
+
+  validate_niri
+  mkdir -p "$STATE_HOME"
+  printf 'restored\n' >"$PROFILE_FILE"
+  success "Configurações originais restauradas"
+  printf '\n%sEncerre e entre novamente na sessão para concluir.%s\n' "$BOLD" "$RESET"
+}
+
+uninstall_switcher() {
+  if [[ -f "$ORIGINAL_HOME/niri-debug.kdl" ]]; then
+    restore_originals
+  else
+    warn "Não há configurações alteradas para restaurar."
+  fi
+
+  local desktop name backup
+  for name in steam.desktop com.heroicgameslauncher.hgl.desktop; do
+    desktop="$LOCAL_APPS/$name"
+    backup="$INSTALL_BACKUP_HOME/$name"
+    if [[ -f "$backup" ]]; then
+      cp -a "$backup" "$desktop"
+    elif grep -q 'Nitro GPU Switcher' "$desktop" 2>/dev/null; then
+      rm -f "$desktop"
+    fi
+  done
+
+  for name in steam heroic; do
+    if [[ -L "$HOME/.local/bin/$name" && "$(realpath "$HOME/.local/bin/$name")" == "$SCRIPT_DIR/nitro-launcher" ]]; then
+      rm -f "$HOME/.local/bin/$name"
+    fi
+    [[ -f "$INSTALL_BACKUP_HOME/bin-$name" ]] && cp -a "$INSTALL_BACKUP_HOME/bin-$name" "$HOME/.local/bin/$name"
+  done
+  for name in nitro-run nitro-gpu; do
+    [[ -L "$HOME/.local/bin/$name" ]] && rm -f "$HOME/.local/bin/$name"
+    [[ -f "$INSTALL_BACKUP_HOME/bin-$name" ]] && cp -a "$INSTALL_BACKUP_HOME/bin-$name" "$HOME/.local/bin/$name"
+  done
+  command -v update-desktop-database >/dev/null && update-desktop-database "$LOCAL_APPS" >/dev/null 2>&1 || true
+  success "Wrappers e atalhos removidos; o repositório local foi preservado"
+}
+
 apply_profile() {
   local profile="$1" renderer
   case "$profile" in
@@ -258,12 +370,15 @@ apply_profile() {
   [[ -f "$NIRI_DEBUG" && -f "$NIRI_ENV" ]] || die "Configuração modular do Niri não encontrada em $NIRI_HOME"
   [[ "$profile" == nvidia ]] || ensure_intel_vulkan
   backup_files
+  capture_originals
 
   info "Aplicando $(profile_name "$profile")..."
+  # Faz a única operação privilegiada antes de alterar arquivos do usuário.
+  # Se o sudo for cancelado, nenhuma configuração ativa fica parcialmente trocada.
+  set_system_environment "$profile"
   set_niri_renderer "$renderer"
   set_niri_environment "$profile"
   set_heroic_profile "$profile"
-  set_system_environment "$profile"
   validate_niri
 
   mkdir -p "$STATE_HOME"
@@ -277,9 +392,11 @@ menu() {
   show_status
   printf '\n%sEscolha um perfil:%s\n\n' "$BOLD" "$RESET"
   printf '  %s1%s  %s100%% NVIDIA%s       Desktop e jogos na GTX 1650\n' "$PURPLE" "$RESET" "$BOLD" "$RESET"
-  printf '  %s2%s  %s100%% Intel%s         Desktop e GTA na Intel UHD\n' "$BLUE" "$RESET" "$BOLD" "$RESET"
-  printf '  %s3%s  %sHíbrido recomendado%s Niri na Intel, GTA na NVIDIA\n' "$GREEN" "$RESET" "$BOLD" "$RESET"
+  printf '  %s2%s  %s100%% Intel%s         Desktop e jogos na Intel UHD\n' "$BLUE" "$RESET" "$BOLD" "$RESET"
+  printf '  %s3%s  %sHíbrido recomendado%s Niri Intel, jogos NVIDIA\n' "$GREEN" "$RESET" "$BOLD" "$RESET"
   printf '  %s4%s  Apenas mostrar o estado\n' "$CYAN" "$RESET"
+  printf '  %s5%s  Restaurar configuração original\n' "$YELLOW" "$RESET"
+  printf '  %s6%s  Restaurar e desinstalar\n' "$RED" "$RESET"
   printf '  %s0%s  Sair\n\n' "$DIM" "$RESET"
   read -r -p "  Perfil › " choice
   case "$choice" in
@@ -287,6 +404,8 @@ menu() {
     2) apply_profile intel ;;
     3) apply_profile hybrid ;;
     4) : ;;
+    5) restore_originals ;;
+    6) uninstall_switcher ;;
     0) exit 0 ;;
     *) die "Opção inválida." ;;
   esac
@@ -297,9 +416,11 @@ usage() {
 Uso: $(basename "$0") [comando]
 
   nvidia   Desktop e jogos na NVIDIA
-  intel    Desktop e GTA na Intel
-  hybrid   Niri na Intel e GTA na NVIDIA (recomendado)
+  intel    Desktop e jogos na Intel
+  hybrid   Niri na Intel e jogos na NVIDIA (recomendado)
   status   Exibe o perfil atual
+  restore  Restaura o estado anterior à primeira alteração
+  uninstall Restaura tudo e remove wrappers e atalhos
   menu     Abre o menu interativo
   version  Exibe a versão
 EOF
@@ -312,6 +433,8 @@ main() {
   case "${1:-menu}" in
     nvidia|intel|hybrid) apply_profile "$1" ;;
     status) show_status ;;
+    restore) restore_originals ;;
+    uninstall) uninstall_switcher ;;
     menu) menu ;;
     version|--version|-v) printf '%s %s\n' "$APP_NAME" "$VERSION" ;;
     help|--help|-h) usage ;;

@@ -15,9 +15,9 @@ Um seletor de perfis de GPU elegante e seguro para notebooks Acer Nitro com **In
 |---|---|---|---|
 | **100% NVIDIA** | NVIDIA | NVIDIA | Compatibilidade máxima, maior uso de VRAM |
 | **100% Intel** | Intel | Intel | Economia de energia e diagnóstico |
-| **Híbrido recomendado** | Intel | NVIDIA | Mais VRAM disponível para o jogo |
+| **Híbrido recomendado** | Intel | NVIDIA | Mais VRAM disponível para os jogos |
 
-No perfil híbrido, o painel e o compositor ficam na Intel enquanto o GTA V continua usando a GTX por PRIME Render Offload. Captura PipeWire e codificação Intel VAAPI/QSV continuam disponíveis.
+No perfil híbrido, o painel e o compositor ficam na Intel enquanto todos os jogos iniciados por Steam e Heroic usam a GTX por PRIME Render Offload. Isso vale para jogos atuais e futuros. Captura PipeWire e codificação Intel VAAPI/QSV continuam disponíveis.
 
 ## Recursos
 
@@ -27,8 +27,12 @@ No perfil híbrido, o painel e o compositor ficam na Intel enquanto o GTA V cont
 - Caminhos DRM estáveis em `/dev/dri/by-path`.
 - Configuração do dispositivo de renderização do Niri.
 - Ajuste das variáveis globais NVIDIA.
-- Seleção da GPU do GTA V no Heroic.
+- Seleção automática da GPU de todos os jogos atuais e futuros do Heroic.
+- Wrappers de Steam e Heroic sensíveis ao perfil ativo.
+- Comando `nitro-run` para programas e jogos externos.
 - Backups automáticos antes de cada alteração.
+- Restauração exata dos arquivos capturados antes da primeira alteração.
+- Desinstalação reversível de wrappers e atalhos.
 - Validação da configuração do Niri.
 - Não encerra sua sessão automaticamente.
 
@@ -53,22 +57,45 @@ nitro-gpu status
 nitro-gpu nvidia
 nitro-gpu intel
 nitro-gpu hybrid
+nitro-gpu restore
+nitro-gpu uninstall
 ```
 
 Após trocar o perfil, encerre e entre novamente na sessão. O script nunca força logout.
+Steam e Heroic que já estavam abertos também precisam ser reiniciados para os jogos herdarem o novo perfil.
 
 ## Arquivos administrados
 
 - `~/.config/niri/config/debug.kdl`
 - `~/.config/niri/config/environment.kdl`
-- `~/.config/heroic/GamesConfig/9d2d0eb64d5c44529cece33fe2a46482.json`
+- `~/.config/heroic/config.json`
+- `~/.config/heroic/GamesConfig/*.json`
 - `/etc/environment`
+- `~/.local/share/applications/steam.desktop`
+- `~/.local/share/applications/com.heroicgameslauncher.hgl.desktop`
 
 Os backups ficam em:
 
 ```text
 ~/.local/state/nitro-gpu-switcher/backups/
 ```
+
+O estado anterior à primeira alteração fica em `original/` e nunca é sobrescrito. Para recuperá-lo:
+
+```bash
+nitro-gpu restore
+```
+
+## Jogos externos
+
+Para executar qualquer programa diretamente na NVIDIA:
+
+```bash
+nitro-run ./meu-jogo
+nitro-run lutris
+```
+
+Os comandos `steam` e `heroic` instalados em `~/.local/bin` consultam o perfil ativo. No híbrido usam NVIDIA; no Intel removem o offload; no NVIDIA usam a GPU dedicada.
 
 ## Requisitos
 
