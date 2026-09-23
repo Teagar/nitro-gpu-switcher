@@ -29,6 +29,7 @@ No perfil híbrido, o painel e o compositor ficam na Intel enquanto todos os jog
 - Ajuste das variáveis globais NVIDIA.
 - Seleção automática da GPU de todos os jogos atuais e futuros do Heroic.
 - Wrappers de Steam e Heroic sensíveis ao perfil ativo.
+- Proteção contra crash do i915 ao combinar Niri/Intel com Gamescope/NVIDIA.
 - Comando `nitro-run` para programas e jogos externos.
 - Backups automáticos antes de cada alteração.
 - Restauração exata dos arquivos capturados antes da primeira alteração.
@@ -96,6 +97,10 @@ nitro-run lutris
 ```
 
 Os comandos `steam` e `heroic` instalados em `~/.local/bin` consultam o perfil ativo. No híbrido usam NVIDIA; no Intel removem o offload; no NVIDIA usam a GPU dedicada.
+
+### Gamescope no perfil híbrido
+
+Gamescope renderizando na NVIDIA e apresentando seus buffers em um Niri renderizado pela Intel pode causar `execbuf ioctl ... ENOMEM` no driver i915 e encerrar a sessão. Por isso, o perfil híbrido guarda e remove automaticamente as opções de Gamescope dos jogos Heroic. Ao mudar para Intel ou NVIDIA, essas opções são restauradas.
 
 ## Requisitos
 

@@ -2,13 +2,14 @@
 set -Eeuo pipefail
 
 APP_NAME="Nitro GPU Switcher"
-VERSION="1.1.0"
+VERSION="1.1.1"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 STATE_HOME="${NITRO_GPU_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/nitro-gpu-switcher}"
 BACKUP_HOME="$STATE_HOME/backups"
 PROFILE_FILE="$STATE_HOME/active-profile"
 ORIGINAL_HOME="$STATE_HOME/original"
 INSTALL_BACKUP_HOME="$STATE_HOME/install-backups"
+GAMESCOPE_STATE_HOME="$STATE_HOME/gamescope-settings"
 NIRI_HOME="${NIRI_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/niri}"
 NIRI_DEBUG="$NIRI_HOME/config/debug.kdl"
 NIRI_ENV="$NIRI_HOME/config/environment.kdl"
@@ -281,6 +282,47 @@ PY
   success "Heroic configurado para todos os jogos atuais e futuros"
 }
 
+manage_gamescope_compatibility() {
+  local profile="$1"
+  [[ -d "$HEROIC_GAMES_DIR" ]] || return
+  python3 - "$HEROIC_GAMES_DIR" "$GAMESCOPE_STATE_HOME" "$profile" <<'PY'
+import json, pathlib, sys
+games_dir, state_dir, profile = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+state_dir.mkdir(parents=True, exist_ok=True)
+
+for path in sorted(games_dir.glob("*.json")):
+    data = json.loads(path.read_text())
+    state_path = state_dir / path.name
+    changed = False
+
+    if profile == "hybrid":
+        saved = {}
+        if state_path.is_file():
+            saved = json.loads(state_path.read_text())
+        for app_id, settings in data.items():
+            if app_id != "version" and isinstance(settings, dict) and "gamescope" in settings:
+                saved[app_id] = settings.pop("gamescope")
+                changed = True
+        if saved:
+            state_path.write_text(json.dumps(saved, indent=2, ensure_ascii=False) + "\n")
+    elif state_path.is_file():
+        saved = json.loads(state_path.read_text())
+        for app_id, gamescope in saved.items():
+            settings = data.get(app_id)
+            if isinstance(settings, dict):
+                settings["gamescope"] = gamescope
+                changed = True
+
+    if changed:
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+PY
+  if [[ "$profile" == hybrid ]]; then
+    success "Gamescope desativado no Heroic para proteger Niri/Intel"
+  else
+    success "Preferências de Gamescope restauradas para este perfil"
+  fi
+}
+
 ensure_intel_vulkan() {
   command -v pacman >/dev/null || return
   if pacman -Q vulkan-intel lib32-vulkan-intel >/dev/null 2>&1; then
@@ -379,6 +421,7 @@ apply_profile() {
   set_niri_renderer "$renderer"
   set_niri_environment "$profile"
   set_heroic_profile "$profile"
+  manage_gamescope_compatibility "$profile"
   validate_niri
 
   mkdir -p "$STATE_HOME"
