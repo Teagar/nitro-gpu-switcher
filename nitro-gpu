@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_NAME="Nitro GPU Switcher"
+VERSION="1.0.0"
+STATE_HOME="${NITRO_GPU_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/nitro-gpu-switcher}"
+BACKUP_HOME="$STATE_HOME/backups"
+PROFILE_FILE="$STATE_HOME/active-profile"
+NIRI_HOME="${NIRI_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/niri}"
+NIRI_DEBUG="$NIRI_HOME/config/debug.kdl"
+NIRI_ENV="$NIRI_HOME/config/environment.kdl"
+SYSTEM_ENV="${SYSTEM_ENV:-/etc/environment}"
+GTA_APP_ID="${GTA_APP_ID:-9d2d0eb64d5c44529cece33fe2a46482}"
+HEROIC_CONFIG="${HEROIC_GTA_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/heroic/GamesConfig/$GTA_APP_ID.json}"
+
+if [[ -t 1 ]]; then
+  RESET=$'\033[0m'; BOLD=$'\033[1m'; DIM=$'\033[2m'
+  CYAN=$'\033[38;5;45m'; BLUE=$'\033[38;5;75m'; GREEN=$'\033[38;5;84m'
+  YELLOW=$'\033[38;5;220m'; RED=$'\033[38;5;203m'; PURPLE=$'\033[38;5;141m'
+else
+  RESET=''; BOLD=''; DIM=''; CYAN=''; BLUE=''; GREEN=''; YELLOW=''; RED=''; PURPLE=''
+fi
+
+info()    { printf '%s●%s %s\n' "$CYAN" "$RESET" "$*"; }
+success() { printf '%s✓%s %s\n' "$GREEN" "$RESET" "$*"; }
+warn()    { printf '%s!%s %s\n' "$YELLOW" "$RESET" "$*"; }
+die()     { printf '%s✕%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
+
+banner() {
+  clear 2>/dev/null || true
+  printf '%s%s' "$BOLD" "$CYAN"
+  cat <<'EOF'
+  ╭──────────────────────────────────────────╮
+  │          NITRO  GPU  SWITCHER            │
+  │       Intel  ◉──────◉  NVIDIA            │
+  ╰──────────────────────────────────────────╯
+EOF
+  printf '%s%s  v%s · Niri + Heroic%s\n\n' "$RESET" "$DIM" "$VERSION" "$RESET"
+}
+
+require_commands() {
+  local command
+  for command in python3 realpath readlink; do
+    command -v "$command" >/dev/null || die "Dependência ausente: $command"
+  done
+}
+
+render_node_for_vendor() {
+  local wanted="$1" node vendor resolved candidate
+  for node in /sys/class/drm/renderD*/device/vendor; do
+    [[ -r "$node" ]] || continue
+    vendor=$(<"$node")
+    [[ "$vendor" == "$wanted" ]] || continue
+    resolved="/dev/dri/$(basename "$(dirname "$(dirname "$node")")")"
+    for candidate in /dev/dri/by-path/*-render; do
+      [[ -L "$candidate" ]] || continue
+      if [[ "$(realpath "$candidate")" == "$(realpath "$resolved")" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done
+    printf '%s\n' "$resolved"
+    return 0
+  done
+  return 1
+}
+
+detect_hardware() {
+  INTEL_RENDER="${INTEL_RENDER:-$(render_node_for_vendor 0x8086 || true)}"
+  NVIDIA_RENDER="${NVIDIA_RENDER:-$(render_node_for_vendor 0x10de || true)}"
+  [[ -n "$INTEL_RENDER" && -e "$INTEL_RENDER" ]] || die "GPU Intel não encontrada."
+  [[ -n "$NVIDIA_RENDER" && -e "$NVIDIA_RENDER" ]] || die "GPU NVIDIA não encontrada."
+}
+
+current_profile() {
+  if [[ -r "$PROFILE_FILE" ]]; then
+    cat "$PROFILE_FILE"
+    return
+  fi
+  local renderer=''
+  renderer=$(sed -n 's/.*render-drm-device "\([^"]*\)".*/\1/p' "$NIRI_DEBUG" 2>/dev/null | head -n1)
+  if [[ "$renderer" == *"01:00.0"* || "$renderer" == *"renderD128"* ]]; then
+    printf 'nvidia\n'
+  elif grep -q '"nvidiaPrime": true' "$HEROIC_CONFIG" 2>/dev/null; then
+    printf 'hybrid\n'
+  else
+    printf 'intel\n'
+  fi
+}
+
+profile_name() {
+  case "$1" in
+    nvidia) printf '100%% NVIDIA' ;;
+    intel)  printf '100%% Intel' ;;
+    hybrid) printf 'Híbrido recomendado' ;;
+    *)      printf 'Desconhecido' ;;
+  esac
+}
+
+show_status() {
+  detect_hardware
+  local profile renderer vram
+  profile=$(current_profile)
+  renderer=$(sed -n 's/.*render-drm-device "\([^"]*\)".*/\1/p' "$NIRI_DEBUG" 2>/dev/null | head -n1)
+  vram=$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader 2>/dev/null | head -n1 || printf 'indisponível')
+
+  printf '%s╭─ Estado atual ───────────────────────────╮%s\n' "$BLUE" "$RESET"
+  printf '  Perfil       %s%s%s\n' "$BOLD" "$(profile_name "$profile")" "$RESET"
+  printf '  Niri         %s\n' "${renderer:-não configurado}"
+  printf '  Intel        %s\n' "$INTEL_RENDER"
+  printf '  NVIDIA       %s\n' "$NVIDIA_RENDER"
+  printf '  VRAM NVIDIA  %s\n' "$vram"
+  printf '%s╰─────────────────────────────────────────╯%s\n' "$BLUE" "$RESET"
+}
+
+backup_files() {
+  BACKUP_DIR="$BACKUP_HOME/$(date +%Y%m%d-%H%M%S)-$$"
+  mkdir -p "$BACKUP_DIR"
+  [[ -f "$NIRI_DEBUG" ]] && cp -a "$NIRI_DEBUG" "$BACKUP_DIR/debug.kdl"
+  [[ -f "$NIRI_ENV" ]] && cp -a "$NIRI_ENV" "$BACKUP_DIR/environment.kdl"
+  [[ -f "$HEROIC_CONFIG" ]] && cp -a "$HEROIC_CONFIG" "$BACKUP_DIR/heroic-gta.json"
+  [[ -r "$SYSTEM_ENV" ]] && cp -a "$SYSTEM_ENV" "$BACKUP_DIR/system-environment"
+  info "Backup: $BACKUP_DIR"
+}
+
+set_niri_renderer() {
+  local renderer="$1"
+  python3 - "$NIRI_DEBUG" "$renderer" <<'PY'
+import pathlib, re, sys
+path = pathlib.Path(sys.argv[1])
+renderer = sys.argv[2]
+text = path.read_text()
+replacement = f'render-drm-device "{renderer}"'
+if re.search(r'render-drm-device\s+"[^"]+"', text):
+    text = re.sub(r'render-drm-device\s+"[^"]+"(?:\s*//[^\n]*)?', replacement, text, count=1)
+else:
+    text = re.sub(r'debug\s*\{', 'debug {\n\t' + replacement, text, count=1)
+path.write_text(text)
+PY
+}
+
+set_niri_environment() {
+  local profile="$1"
+  python3 - "$NIRI_ENV" "$profile" <<'PY'
+import pathlib, re, sys
+path = pathlib.Path(sys.argv[1])
+profile = sys.argv[2]
+text = path.read_text()
+if profile == "nvidia":
+    values = {
+        "__NV_PRIME_RENDER_OFFLOAD": '"1"',
+        "__GLX_VENDOR_LIBRARY_NAME": '"nvidia"',
+        "GBM_BACKEND": '"nvidia-drm"',
+        "DRI_PRIME": '"1"',
+    }
+else:
+    values = {
+        "__NV_PRIME_RENDER_OFFLOAD": "null",
+        "__GLX_VENDOR_LIBRARY_NAME": "null",
+        "GBM_BACKEND": "null",
+        "DRI_PRIME": "null" if profile == "hybrid" else '"0"',
+    }
+for key, value in values.items():
+    pattern = rf'(?m)^(\s*){re.escape(key)}\s+(?:"[^"]*"|null)\s*$'
+    if re.search(pattern, text):
+        text = re.sub(pattern, lambda m: f'{m.group(1)}{key} {value}', text, count=1)
+    else:
+        text = re.sub(r'environment\s*\{', f'environment {{\n  {key} {value}', text, count=1)
+path.write_text(text)
+PY
+}
+
+set_system_environment() {
+  local profile="$1" temp
+  temp=$(mktemp)
+  python3 - "$SYSTEM_ENV" "$profile" >"$temp" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+profile = sys.argv[2]
+lines = path.read_text().splitlines()
+managed = {"__NV_PRIME_RENDER_OFFLOAD", "__GLX_VENDOR_LIBRARY_NAME"}
+lines = [line for line in lines if line.split("=", 1)[0].strip() not in managed]
+if profile == "nvidia":
+    lines.extend(["__NV_PRIME_RENDER_OFFLOAD=1", "__GLX_VENDOR_LIBRARY_NAME=nvidia"])
+print("\n".join(lines).rstrip() + "\n")
+PY
+  sudo install -m 0644 "$temp" "$SYSTEM_ENV"
+  rm -f "$temp"
+}
+
+set_heroic_profile() {
+  local profile="$1"
+  [[ -f "$HEROIC_CONFIG" ]] || { warn "Configuração do GTA não encontrada; etapa Heroic ignorada."; return; }
+  python3 - "$HEROIC_CONFIG" "$GTA_APP_ID" "$profile" <<'PY'
+import json, pathlib, sys
+path, app_id, profile = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+data = json.loads(path.read_text())
+game = data.get(app_id)
+if not isinstance(game, dict):
+    raise SystemExit(f"Entrada {app_id} não encontrada em {path}")
+
+managed = {
+    "__NV_PRIME_RENDER_OFFLOAD", "__GLX_VENDOR_LIBRARY_NAME",
+    "__VK_LAYER_NV_optimus", "DRI_PRIME", "DXVK_FILTER_DEVICE_NAME"
+}
+options = [item for item in game.get("enviromentOptions", [])
+           if item.get("key") not in managed]
+if profile in {"nvidia", "hybrid"}:
+    game["nvidiaPrime"] = True
+    options += [
+        {"key": "__NV_PRIME_RENDER_OFFLOAD", "value": "1"},
+        {"key": "__GLX_VENDOR_LIBRARY_NAME", "value": "nvidia"},
+        {"key": "__VK_LAYER_NV_optimus", "value": "NVIDIA_only"},
+        {"key": "DRI_PRIME", "value": "1"},
+    ]
+else:
+    game["nvidiaPrime"] = False
+    options += [
+        {"key": "DRI_PRIME", "value": "0"},
+        {"key": "DXVK_FILTER_DEVICE_NAME", "value": "Intel"},
+    ]
+game["enviromentOptions"] = options
+path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+PY
+}
+
+ensure_intel_vulkan() {
+  command -v pacman >/dev/null || return
+  if pacman -Q vulkan-intel lib32-vulkan-intel >/dev/null 2>&1; then
+    return
+  fi
+  warn "Drivers Vulkan Intel ausentes. Eles são necessários para o perfil Intel completo."
+  if [[ -t 0 ]]; then
+    read -r -p "  Instalar vulkan-intel e lib32-vulkan-intel agora? [S/n] " answer
+    if [[ ! "$answer" =~ ^[Nn]$ ]]; then
+      sudo pacman -S --needed vulkan-intel lib32-vulkan-intel
+    fi
+  fi
+}
+
+validate_niri() {
+  if command -v niri >/dev/null; then
+    if ! niri validate >/dev/null; then
+      die "A validação do Niri falhou. Restaure os arquivos em $BACKUP_DIR"
+    fi
+    success "Configuração do Niri validada"
+  fi
+}
+
+apply_profile() {
+  local profile="$1" renderer
+  case "$profile" in
+    nvidia) renderer="$NVIDIA_RENDER" ;;
+    intel|hybrid) renderer="$INTEL_RENDER" ;;
+    *) die "Perfil inválido: $profile" ;;
+  esac
+
+  [[ -f "$NIRI_DEBUG" && -f "$NIRI_ENV" ]] || die "Configuração modular do Niri não encontrada em $NIRI_HOME"
+  [[ "$profile" == nvidia ]] || ensure_intel_vulkan
+  backup_files
+
+  info "Aplicando $(profile_name "$profile")..."
+  set_niri_renderer "$renderer"
+  set_niri_environment "$profile"
+  set_heroic_profile "$profile"
+  set_system_environment "$profile"
+  validate_niri
+
+  mkdir -p "$STATE_HOME"
+  printf '%s\n' "$profile" >"$PROFILE_FILE"
+  success "Perfil $(profile_name "$profile") aplicado"
+  printf '\n%sÉ necessário encerrar e entrar novamente na sessão.%s\n' "$BOLD" "$RESET"
+  printf '%sO script não encerra sua sessão automaticamente.%s\n' "$DIM" "$RESET"
+}
+
+menu() {
+  show_status
+  printf '\n%sEscolha um perfil:%s\n\n' "$BOLD" "$RESET"
+  printf '  %s1%s  %s100%% NVIDIA%s       Desktop e jogos na GTX 1650\n' "$PURPLE" "$RESET" "$BOLD" "$RESET"
+  printf '  %s2%s  %s100%% Intel%s         Desktop e GTA na Intel UHD\n' "$BLUE" "$RESET" "$BOLD" "$RESET"
+  printf '  %s3%s  %sHíbrido recomendado%s Niri na Intel, GTA na NVIDIA\n' "$GREEN" "$RESET" "$BOLD" "$RESET"
+  printf '  %s4%s  Apenas mostrar o estado\n' "$CYAN" "$RESET"
+  printf '  %s0%s  Sair\n\n' "$DIM" "$RESET"
+  read -r -p "  Perfil › " choice
+  case "$choice" in
+    1) apply_profile nvidia ;;
+    2) apply_profile intel ;;
+    3) apply_profile hybrid ;;
+    4) : ;;
+    0) exit 0 ;;
+    *) die "Opção inválida." ;;
+  esac
+}
+
+usage() {
+  cat <<EOF
+Uso: $(basename "$0") [comando]
+
+  nvidia   Desktop e jogos na NVIDIA
+  intel    Desktop e GTA na Intel
+  hybrid   Niri na Intel e GTA na NVIDIA (recomendado)
+  status   Exibe o perfil atual
+  menu     Abre o menu interativo
+  version  Exibe a versão
+EOF
+}
+
+main() {
+  require_commands
+  banner
+  detect_hardware
+  case "${1:-menu}" in
+    nvidia|intel|hybrid) apply_profile "$1" ;;
+    status) show_status ;;
+    menu) menu ;;
+    version|--version|-v) printf '%s %s\n' "$APP_NAME" "$VERSION" ;;
+    help|--help|-h) usage ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"
